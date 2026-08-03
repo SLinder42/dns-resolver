@@ -183,11 +183,12 @@ class DNSPacket:
 	questions: List[DNSQuestion]
 	answers: List[DNSRecord]
 	authorities: List[DNSRecord]
+	additionals: List[DNSRecord]
 
 def parse_dns_packet(data):
 	reader = BytesIO(data)
 	header = parse_header(reader)
-	questions = [parse_questions(reader) for _ in range(header.num_questions)]
+	questions = [parse_question(reader) for _ in range(header.num_questions)]
 	answers = [parse_record(reader) for _ in range(header.num_answers)]
 	authorities = [parse_record(reader) for _ in range(header.num_authorities)]
 	additionals = [parse_record(reader) for _ in range(header.num_additionals)]
@@ -215,7 +216,7 @@ def lookup_domain(domain_name):
 	sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 	sock.sendto(query, ("8.8.8.8", 53))
 	# Get response
-	data, _ = sock.revfrom(1024)
+	data, _ = sock.recvfrom(1024)
 	response = parse_dns_packet(data)
 	return ip_to_string(response.answers[0].data)
 
@@ -275,29 +276,30 @@ def send_query(ip_address, domain_name, record_type):
 	sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 	sock.sendto(query, (ip_address, 53))
 	data, _ = sock.recvfrom(1024)
-	return parse_dns_packet
+	return parse_dns_packet(data)
 
 # Test input 1
-send_query("8.8.8.8", "example.com", TYPE_A).answers[0]
+# send_query("8.8.8.8", "example.com", TYPE_A).answers[0]
 # Test output 1
 # DNSRecord(name=b'example.com', type_=1, class_=1, ttl=18366, data=b']\xb8\xd8"')
 
 # Test input 2
-TYPE_TXT = 16
-send_query("8.8.8.8", "example.com", TYPE_TXT).answers
+# TYPE_TXT = 16
+# send_query("8.8.8.8", "example.com", TYPE_TXT).answers
 # Test output 2
 # []
 
 # Modify parsing to include NS records
 # TYPE_A = 1
 TYPE_NS = 2
+TYPE_CNAME = 5
 # import struct
 
 def parse_record(reader):
 	name = decode_name(reader)
 	data = reader.read(10)
 	type_, class_, ttl, data_len = struct. unpack("!HHIH", data)
-	if type_ == TYPE_NS:
+	if type_ == TYPE_NS or type_ == TYPE_CNAME:
 		data = decode_name(reader)
 	elif type_ == TYPE_A:
 		data = ip_to_string(reader.read(data_len))
@@ -312,7 +314,7 @@ def parse_record(reader):
 def parse_dns_packet(data):
 	reader = BytesIO(data)
 	header = parse_header(reader)
-	questions = [parse_questions(reader) for _ in range(header.num_questions)]
+	questions = [parse_question(reader) for _ in range(header.num_questions)]
 	answers = [parse_record(reader) for _ in range(header.num_answers)]
 	authorities = [parse_record(reader) for _ in range(header.num_authorities)]
 	additionals = [parse_record(reader) for _ in range(header.num_additionals)]
@@ -323,6 +325,12 @@ def parse_dns_packet(data):
 def get_answer(packet):
 	for x in packet.answers:
 		if x.type_ == TYPE_A:
+			return x.data
+
+# Return first CNAME record in Answer section
+def get_cname(packet):
+	for x in packet.answers:
+		if x.type_ == TYPE_CNAME:
 			return x.data
 
 # Return first A record in Additional section
@@ -344,6 +352,9 @@ def resolve(domain_name, record_type):
 		response = send_query(nameserver, domain_name, record_type)
 		if ip := get_answer(response):
 			return ip
+		elif cname := get_cname(response):
+			print(f"Following CNAME: {domain_name} -> {cname.decode('ascii')}")
+			return resolve(cname.decode("ascii"), TYPE_A)
 		elif nsIP := get_nameserver_ip(response):
 			nameserver = nsIP
 		# Check for IP address of nameserver
@@ -435,3 +446,14 @@ def resolve(domain_name, record_type):
 # A domain that returns multiple A records.
 # A subdomain (e.g. www.example.com).
 # An error case (e.g. a nonexistent domain) and how your resolver behaves.
+
+import sys
+
+if __name__ == "__main__":
+	if len(sys.argv) != 2:
+		print("Usage: python3 resolver.py DOMAIN")
+		raise SystemExit(1)
+
+	domain_name = sys.argv[1]
+	ip_address = resolve(domain_name, TYPE_A)
+	print(ip_address)
