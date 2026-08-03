@@ -292,13 +292,14 @@ def send_query(ip_address, domain_name, record_type):
 # Modify parsing to include NS records
 # TYPE_A = 1
 TYPE_NS = 2
+TYPE_CNAME = 5
 # import struct
 
 def parse_record(reader):
 	name = decode_name(reader)
 	data = reader.read(10)
 	type_, class_, ttl, data_len = struct. unpack("!HHIH", data)
-	if type_ == TYPE_NS:
+	if type_ == TYPE_NS or type_ == TYPE_CNAME:
 		data = decode_name(reader)
 	elif type_ == TYPE_A:
 		data = ip_to_string(reader.read(data_len))
@@ -326,6 +327,12 @@ def get_answer(packet):
 		if x.type_ == TYPE_A:
 			return x.data
 
+# Return first CNAME record in Answer section
+def get_cname(packet):
+	for x in packet.answers:
+		if x.type_ == TYPE_CNAME:
+			return x.data
+
 # Return first A record in Additional section
 def get_nameserver_ip(packet):
 	for x in packet.additionals:
@@ -345,6 +352,9 @@ def resolve(domain_name, record_type):
 		response = send_query(nameserver, domain_name, record_type)
 		if ip := get_answer(response):
 			return ip
+		elif cname := get_cname(response):
+			print(f"Following CNAME: {domain_name} -> {cname.decode('ascii')}")
+			return resolve(cname.decode("ascii"), TYPE_A)
 		elif nsIP := get_nameserver_ip(response):
 			nameserver = nsIP
 		# Check for IP address of nameserver
