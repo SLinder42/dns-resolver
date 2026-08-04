@@ -272,10 +272,21 @@ def build_query(domain_name, record_type):
 
 # Send the query
 def send_query(ip_address, domain_name, record_type):
+	global QUERY_COUNT
+
+	QUERY_COUNT += 1
+	domain_name = normalize_name(domain_name)
+
 	query = build_query(domain_name, record_type)
 	sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-	sock.sendto(query, (ip_address, 53))
-	data, _ = sock.recvfrom(1024)
+	sock.settimeout(5)
+
+	try:
+		sock.sendto(query, (ip_address, 53))
+		data, _ = sock.recvfrom(4096)
+	finally:
+		sock.close()
+
 	return parse_dns_packet(data)
 
 # Test input 1
@@ -294,6 +305,137 @@ def send_query(ip_address, domain_name, record_type):
 TYPE_NS = 2
 TYPE_CNAME = 5
 # import struct
+
+# ---------------------------------------------------------
+# Phase 2: TTL-based DNS record cache
+# ---------------------------------------------------------
+
+import time
+
+# Key: (normalized record name, record type)
+# Value: list of dictionaries containing data and expiration time
+CACHE = {}
+
+# Counts actual UDP DNS requests for cache testing
+QUERY_COUNT = 0
+
+# Used only by --ttl-test to avoid waiting for a real, long DNS TTL.
+# Normal execution leaves this as None and honors the actual DNS TTL.
+TEST_TTL_CAP = None
+
+
+def normalize_name(name):
+	"""Convert DNS names to lowercase strings without a trailing period."""
+	if isinstance(name, bytes):
+		name = name.decode("ascii")
+
+	return name.rstrip(".").lower()
+
+
+def clear_cache():
+	"""Remove every cached DNS record."""
+	CACHE.clear()
+
+
+def cache_record(record):
+	"""Store one DNS record using its owner name and record type."""
+	name = normalize_name(record.name)
+	key = (name, record.type_)
+
+	ttl = record.ttl
+
+	# This cap is used only for the documented TTL-expiration test.
+	if TEST_TTL_CAP is not None:
+		ttl = min(ttl, TEST_TTL_CAP)
+
+	expires_at = time.time() + ttl
+
+	entry = {
+		"data": record.data,
+		"expires_at": expires_at,
+		"ttl": ttl,
+	}
+
+	CACHE.setdefault(key, [])
+
+	# Avoid storing the same record repeatedly.
+	for old_entry in CACHE[key]:
+		if old_entry["data"] == record.data:
+			old_entry.update(entry)
+			return
+
+	CACHE[key].append(entry)
+
+
+def cache_packet(packet):
+	"""Cache answer, authority, and additional records."""
+	for record in packet.answers:
+		cache_record(record)
+
+	for record in packet.authorities:
+		cache_record(record)
+
+	for record in packet.additionals:
+		cache_record(record)
+
+
+def get_cached_records(name, record_type):
+	"""Return unexpired cached values for (name, type)."""
+	key = (normalize_name(name), record_type)
+	entries = CACHE.get(key, [])
+
+	if not entries:
+		return []
+
+	now = time.time()
+	valid_entries = []
+
+	for entry in entries:
+		if now < entry["expires_at"]:
+			valid_entries.append(entry)
+		else:
+			print(
+				f"CACHE EXPIRED: {key[0]} "
+				f"type={record_type}"
+			)
+
+	if valid_entries:
+		CACHE[key] = valid_entries
+		print(f"CACHE HIT: {key[0]} type={record_type}")
+		return [entry["data"] for entry in valid_entries]
+
+	# Everything under this key expired.
+	CACHE.pop(key, None)
+	return []
+
+
+def find_cached_nameserver(domain_name):
+	"""
+	Find the most specific cached NS delegation with cached glue.
+
+	For example, after resolving example.com, a later lookup for
+	www.example.com can begin at example.com's cached authoritative
+	server instead of starting again at the root.
+	"""
+	normalized = normalize_name(domain_name)
+	labels = normalized.split(".")
+
+	# Search from most specific suffix to least specific suffix.
+	for index in range(len(labels)):
+		suffix = ".".join(labels[index:])
+		ns_domains = get_cached_records(suffix, TYPE_NS)
+
+		for ns_domain in ns_domains:
+			ns_ips = get_cached_records(ns_domain, TYPE_A)
+
+			if ns_ips:
+				print(
+					f"Using cached delegation for {suffix}: "
+					f"{normalize_name(ns_domain)} -> {ns_ips[0]}"
+				)
+				return ns_ips[0]
+
+	return None
 
 def parse_record(reader):
 	name = decode_name(reader)
@@ -346,22 +488,57 @@ def get_nameserver(packet):
 			return x.data
 
 def resolve(domain_name, record_type):
-	nameserver = "198.41.0.4"
+	domain_name = normalize_name(domain_name)
+
+	# Check for a final cached answer before using the network.
+	cached_answers = get_cached_records(domain_name, record_type)
+
+	if cached_answers:
+		return cached_answers[0]
+
+	# If an A lookup has a cached CNAME, follow it.
+	if record_type == TYPE_A:
+		cached_cnames = get_cached_records(domain_name, TYPE_CNAME)
+
+		if cached_cnames:
+			cname = normalize_name(cached_cnames[0])
+			print(f"Following cached CNAME: {domain_name} -> {cname}")
+			return resolve(cname, TYPE_A)
+
+	# Try the most specific cached delegation before starting at root.
+	nameserver = find_cached_nameserver(domain_name)
+
+	if nameserver is None:
+		nameserver = "198.41.0.4"
+		print(f"CACHE MISS: {domain_name} type={record_type}")
+
 	while True:
 		print(f"Querying {nameserver} for {domain_name}")
 		response = send_query(nameserver, domain_name, record_type)
+
+		# Cache final answers, NS referrals, and glue A records.
+		cache_packet(response)
+
 		if ip := get_answer(response):
 			return ip
+
 		elif cname := get_cname(response):
-			print(f"Following CNAME: {domain_name} -> {cname.decode('ascii')}")
-			return resolve(cname.decode("ascii"), TYPE_A)
-		elif nsIP := get_nameserver_ip(response):
-			nameserver = nsIP
-		# Check for IP address of nameserver
+			cname = normalize_name(cname)
+			print(f"Following CNAME: {domain_name} -> {cname}")
+			return resolve(cname, TYPE_A)
+
+		elif ns_ip := get_nameserver_ip(response):
+			nameserver = ns_ip
+
 		elif ns_domain := get_nameserver(response):
+			ns_domain = normalize_name(ns_domain)
 			nameserver = resolve(ns_domain, TYPE_A)
+
 		else:
-			raise Exception("Something went wrong")
+			raise Exception(
+				f"Unable to resolve {domain_name}: "
+				"response contained no usable answer or referral"
+			)
 
 # Exercise 1: make it work with CNAME records
 # Some domain don’t have an A record: instead they have a CNAME record
@@ -449,11 +626,94 @@ def resolve(domain_name, record_type):
 
 import sys
 
-if __name__ == "__main__":
-	if len(sys.argv) != 2:
-		print("Usage: python3 resolver.py DOMAIN")
-		raise SystemExit(1)
 
-	domain_name = sys.argv[1]
-	ip_address = resolve(domain_name, TYPE_A)
-	print(ip_address)
+def run_cache_hit_test(domain_name):
+	global QUERY_COUNT
+
+	clear_cache()
+	QUERY_COUNT = 0
+
+	print("\n=== FIRST LOOKUP ===")
+	first_ip = resolve(domain_name, TYPE_A)
+	first_count = QUERY_COUNT
+	print(f"Result: {first_ip}")
+	print(f"Network queries: {first_count}")
+
+	print("\n=== SECOND LOOKUP ===")
+	second_ip = resolve(domain_name, TYPE_A)
+	second_count = QUERY_COUNT - first_count
+	print(f"Result: {second_ip}")
+	print(f"New network queries: {second_count}")
+
+
+def run_ttl_test(domain_name):
+	global QUERY_COUNT
+	global TEST_TTL_CAP
+
+	clear_cache()
+	QUERY_COUNT = 0
+	TEST_TTL_CAP = 2
+
+	try:
+		print("\n=== INITIAL LOOKUP ===")
+		first_ip = resolve(domain_name, TYPE_A)
+		first_count = QUERY_COUNT
+		print(f"Result: {first_ip}")
+		print(f"Network queries: {first_count}")
+
+		print("\nWaiting 3 seconds for the test TTL to expire...")
+		time.sleep(3)
+
+		print("\n=== LOOKUP AFTER EXPIRATION ===")
+		second_ip = resolve(domain_name, TYPE_A)
+		second_count = QUERY_COUNT - first_count
+		print(f"Result: {second_ip}")
+		print(f"New network queries: {second_count}")
+	finally:
+		TEST_TTL_CAP = None
+
+
+def run_delegation_test(first_domain, second_domain):
+	global QUERY_COUNT
+
+	clear_cache()
+	QUERY_COUNT = 0
+
+	print(f"\n=== FIRST LOOKUP: {first_domain} ===")
+	first_ip = resolve(first_domain, TYPE_A)
+	first_count = QUERY_COUNT
+	print(f"Result: {first_ip}")
+	print(f"Network queries: {first_count}")
+
+	print(f"\n=== SECOND LOOKUP: {second_domain} ===")
+	second_ip = resolve(second_domain, TYPE_A)
+	second_count = QUERY_COUNT - first_count
+	print(f"Result: {second_ip}")
+	print(f"New network queries: {second_count}")
+
+
+if __name__ == "__main__":
+	if len(sys.argv) == 2:
+		domain_name = sys.argv[1]
+		ip_address = resolve(domain_name, TYPE_A)
+		print(ip_address)
+
+	elif len(sys.argv) == 3 and sys.argv[1] == "--cache-test":
+		run_cache_hit_test(sys.argv[2])
+
+	elif len(sys.argv) == 3 and sys.argv[1] == "--ttl-test":
+		run_ttl_test(sys.argv[2])
+
+	elif len(sys.argv) == 4 and sys.argv[1] == "--delegation-test":
+		run_delegation_test(sys.argv[2], sys.argv[3])
+
+	else:
+		print("Usage:")
+		print("  python3 resolver.py DOMAIN")
+		print("  python3 resolver.py --cache-test DOMAIN")
+		print("  python3 resolver.py --ttl-test DOMAIN")
+		print(
+			"  python3 resolver.py --delegation-test "
+			"FIRST_DOMAIN SECOND_DOMAIN"
+		)
+		raise SystemExit(1)
